@@ -1,0 +1,8 @@
+{
+  "name": "MamaAI - Cooking Companion",
+  "description": "An AI-powered cooking assistant that watches you cook in real-time, offering step-by-step guidance, safety checks, and encouraging feedback.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
