@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { ChefHat, Camera, Mic, Volume2, ArrowLeft, Clock, AlertCircle, Sparkles, Utensils, Play, X, Loader2, RefreshCw, QrCode, Copy, Check, Share2, Edit2 } from 'lucide-react';
+import { ChefHat, Camera, Mic, Volume2, ArrowLeft, Clock, AlertCircle, Sparkles, Utensils, Play, X, Loader2, RefreshCw, QrCode, Copy, Check, Share2, Edit2, RotateCcw } from 'lucide-react';
 import { suggestRecipes } from './services/geminiService';
 import { LiveClient } from './services/liveClient';
 import { AppScreen, Ingredient, Recipe, LiveStatus } from './types';
@@ -19,6 +19,7 @@ export default function App() {
   const [editableUrl, setEditableUrl] = useState('');
   const [isEditingUrl, setIsEditingUrl] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
 
   // Live Client Ref
   const liveClientRef = useRef<LiveClient | null>(null);
@@ -27,7 +28,6 @@ export default function App() {
   useEffect(() => {
     if (typeof window !== 'undefined') {
         const url = window.location.href;
-        // Clean up internal sandbox URLs for display if possible, otherwise keep as is
         setCurrentUrl(url);
         setEditableUrl(url);
     }
@@ -61,6 +61,7 @@ export default function App() {
   const startLiveCooking = async () => {
     if (!selectedRecipe) return;
     setScreen(AppScreen.LIVE_COOKING);
+    setErrorMessage('');
     
     // Initialize Live Client
     const client = new LiveClient();
@@ -68,7 +69,8 @@ export default function App() {
 
     // Hook up UI callbacks
     client.onStatusChange = (status) => setLiveStatus(status);
-    client.onAudioLevel = (level) => setAudioLevel(Math.min(level * 5, 1)); // Amplify for visuals
+    client.onAudioLevel = (level) => setAudioLevel(Math.min(level * 5, 1));
+    client.onError = (msg) => setErrorMessage(msg);
 
     // Connect
     const recipeContext = `
@@ -79,11 +81,15 @@ export default function App() {
     await client.connect(recipeContext);
   };
 
-  // Re-connect handler for when session drops
   const handleReconnect = async () => {
-      // Disconnect existing if any
       liveClientRef.current?.disconnect();
       await startLiveCooking();
+  };
+
+  const handleFlipCamera = async () => {
+      if (liveClientRef.current && videoRef.current) {
+          await liveClientRef.current.switchCamera(videoRef.current);
+      }
   };
 
   const handleCopyUrl = () => {
@@ -108,7 +114,6 @@ export default function App() {
     }
   };
 
-  // Effect to start video loop once we are in LIVE_COOKING and connected
   useEffect(() => {
     if (screen === AppScreen.LIVE_COOKING && liveStatus === 'CONNECTED' && videoRef.current && liveClientRef.current) {
         liveClientRef.current.startVideoLoop(videoRef.current);
@@ -119,6 +124,7 @@ export default function App() {
     liveClientRef.current?.disconnect();
     setScreen(AppScreen.HOME);
     setLiveStatus(LiveStatus.DISCONNECTED);
+    setErrorMessage('');
   };
 
   // --- Renders ---
@@ -381,7 +387,6 @@ export default function App() {
     </div>
   );
 
-  // Helper for Status Overlay in Live Mode
   const renderStatusOverlay = () => {
     if (liveStatus === 'CONNECTING') {
         return (
@@ -392,21 +397,25 @@ export default function App() {
         );
     }
     
-    // Explicitly handle disconnect/error to show a Resume Button instead of an infinite loader
     if (liveStatus === 'DISCONNECTED' || liveStatus === 'ERROR') {
         return (
             <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-slate-900/90 backdrop-blur-sm p-6 text-center">
                 <AlertCircle className="w-12 h-12 text-red-400 mb-4" />
                 <h3 className="text-xl font-bold text-white mb-2">Session Paused</h3>
-                <p className="text-slate-400 mb-8 max-w-xs mx-auto">
-                    The connection was lost. Don't worry, your cooking plan is safe.
+                <p className="text-slate-400 mb-2 max-w-xs mx-auto">
+                    {errorMessage || "The connection was lost."}
                 </p>
-                <button 
-                    onClick={handleReconnect}
-                    className="px-8 py-3 bg-white text-slate-900 font-bold rounded-full hover:bg-emerald-50 transition-colors flex items-center gap-2"
-                >
-                    <RefreshCw className="w-4 h-4" /> Resume Cooking
-                </button>
+                <div className="flex gap-4 mt-6">
+                    <button onClick={endSession} className="px-6 py-3 bg-slate-800 text-white font-semibold rounded-full hover:bg-slate-700 transition-colors">
+                        Cancel
+                    </button>
+                    <button 
+                        onClick={handleReconnect}
+                        className="px-8 py-3 bg-white text-slate-900 font-bold rounded-full hover:bg-emerald-50 transition-colors flex items-center gap-2"
+                    >
+                        <RefreshCw className="w-4 h-4" /> Resume
+                    </button>
+                </div>
              </div>
         );
     }
@@ -432,22 +441,27 @@ export default function App() {
             <button onClick={endSession} className="bg-red-500/80 backdrop-blur-md text-white px-4 py-2 rounded-full text-sm font-semibold shadow-lg hover:bg-red-600/80 transition-colors">
                 End Session
             </button>
-            <div className={`px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider backdrop-blur-md shadow-lg flex items-center gap-2 ${
-                liveStatus === 'CONNECTED' ? 'bg-emerald-500/80 text-white' : 'bg-slate-700/80 text-slate-300'
-            }`}>
-                {liveStatus === 'CONNECTED' ? (
-                    <><span className="w-2 h-2 rounded-full bg-white animate-pulse" /> LIVE</>
-                ) : liveStatus}
+            <div className="flex gap-3">
+                 <button 
+                    onClick={handleFlipCamera}
+                    className="bg-slate-800/80 backdrop-blur-md text-white p-2 rounded-full shadow-lg hover:bg-slate-700/80 transition-colors"
+                 >
+                    <RotateCcw className="w-5 h-5" />
+                 </button>
+                <div className={`px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider backdrop-blur-md shadow-lg flex items-center gap-2 ${
+                    liveStatus === 'CONNECTED' ? 'bg-emerald-500/80 text-white' : 'bg-slate-700/80 text-slate-300'
+                }`}>
+                    {liveStatus === 'CONNECTED' ? (
+                        <><span className="w-2 h-2 rounded-full bg-white animate-pulse" /> LIVE</>
+                    ) : liveStatus}
+                </div>
             </div>
         </div>
 
-        {/* Status / Loading / Error Overlay */}
         {renderStatusOverlay()}
 
-        {/* Bottom AI Interface (Only show if connected or connecting, hide on error screen) */}
         {(liveStatus === 'CONNECTED' || liveStatus === 'CONNECTING') && (
             <div className="absolute bottom-0 left-0 right-0 p-6 z-10">
-                {/* Audio Visualization */}
                 <div className="flex justify-center items-center gap-1 h-12 mb-6">
                     {[...Array(5)].map((_, i) => (
                         <div 

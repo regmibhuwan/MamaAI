@@ -17,10 +17,12 @@ export class LiveClient {
   private nextStartTime: number = 0;
   private videoInterval: number | null = null;
   private stream: MediaStream | null = null;
+  private currentFacingMode: "user" | "environment" = "environment";
   
   // Callbacks
   public onStatusChange: (status: string) => void = () => {};
   public onAudioLevel: (level: number) => void = () => {};
+  public onError: (message: string) => void = () => {};
 
   constructor() {
     this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -31,7 +33,6 @@ export class LiveClient {
 
     try {
       // 1. Setup Audio Contexts
-      // We must create these before getUserMedia to ensure we can resume them
       this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: AUDIO_INPUT_SAMPLE_RATE,
       });
@@ -41,24 +42,12 @@ export class LiveClient {
       this.outputNode = this.outputAudioContext.createGain();
       this.outputNode.connect(this.outputAudioContext.destination);
 
-      // CRITICAL: Resume contexts immediately. Browsers often suspend them until gesture, 
-      // but we are usually in a click handler here.
+      // CRITICAL: Resume contexts immediately.
       await this.inputAudioContext.resume();
       await this.outputAudioContext.resume();
 
-      // 2. Get Media Stream (Mic & Camera)
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: AUDIO_INPUT_SAMPLE_RATE,
-        },
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          facingMode: "environment", // Rear camera preferred for cooking
-        },
-      });
+      // 2. Get Media Stream
+      await this.initStream();
 
       // 3. Connect to Gemini Live
       const config = {
@@ -101,6 +90,7 @@ export class LiveClient {
           },
           onerror: (err) => {
             console.error("Live API Error:", err);
+            this.onError("Connection to AI failed.");
             this.onStatusChange("ERROR");
             this.cleanupResources();
           },
@@ -109,24 +99,76 @@ export class LiveClient {
 
       this.session = sessionPromise;
       
-    } catch (error) {
+    } catch (error: any) {
       console.error("Connection failed:", error);
+      
+      let errorMsg = "Failed to connect.";
+      if (error.name === 'NotAllowedError') {
+        errorMsg = "Camera/Microphone access denied. Please allow permissions.";
+      } else if (error.name === 'NotFoundError') {
+        errorMsg = "No camera or microphone found.";
+      }
+      
+      this.onError(errorMsg);
       this.onStatusChange("ERROR");
       this.cleanupResources();
+    }
+  }
+
+  private async initStream() {
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        sampleRate: AUDIO_INPUT_SAMPLE_RATE,
+      },
+      video: {
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        facingMode: this.currentFacingMode,
+      },
+    });
+  }
+
+  async switchCamera(videoElement: HTMLVideoElement) {
+    try {
+      if (this.stream) {
+        this.stream.getTracks().forEach(t => t.stop());
+      }
+      
+      // Toggle mode
+      this.currentFacingMode = this.currentFacingMode === 'user' ? 'environment' : 'user';
+      
+      await this.initStream();
+      
+      // Re-attach to video element
+      videoElement.srcObject = this.stream;
+      videoElement.play().catch(console.error);
+      
+      // Re-attach audio input if session is active
+      if (this.session && this.inputAudioContext) {
+        // Disconnect old processor/source if they exist
+        if (this.inputSource) this.inputSource.disconnect();
+        if (this.processor) this.processor.disconnect();
+        
+        // Restart audio input loop with new stream
+        this.startAudioInput(this.session);
+      }
+    } catch (error) {
+      console.error("Failed to switch camera:", error);
+      this.onError("Failed to switch camera.");
     }
   }
 
   startVideoLoop(videoElement: HTMLVideoElement) {
     if (!this.stream) return;
 
-    // Ensure video element is playing the stream
     videoElement.srcObject = this.stream;
     videoElement.play().catch(e => console.error("Video play error", e));
 
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d");
 
-    // Clear any existing interval
     if (this.videoInterval) clearInterval(this.videoInterval);
 
     this.videoInterval = window.setInterval(() => {
@@ -138,7 +180,6 @@ export class LiveClient {
 
         const base64Data = canvas.toDataURL("image/jpeg", JPEG_QUALITY).split(",")[1];
 
-        // Send frame if session is ready
         this.session.then((s: any) => {
              s.sendRealtimeInput({
                 media: {
@@ -146,9 +187,7 @@ export class LiveClient {
                     data: base64Data
                 }
             });
-        }).catch(() => {
-            // Ignore send errors if session is closed
-        });
+        }).catch(() => {});
 
     }, 1000 / VIDEO_FPS);
   }
@@ -162,14 +201,12 @@ export class LiveClient {
     this.processor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Calculate volume for UI visualization
       let sum = 0;
       for (let i = 0; i < inputData.length; i++) {
         sum += inputData[i] * inputData[i];
       }
       this.onAudioLevel(Math.sqrt(sum / inputData.length));
 
-      // Create blob and send
       const pcm16 = this.floatTo16BitPCM(inputData);
       const base64 = this.arrayBufferToBase64(pcm16.buffer);
 
@@ -191,7 +228,6 @@ export class LiveClient {
     const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
     
     if (audioData && this.outputAudioContext && this.outputNode) {
-        // Handle interruptions
         if (message.serverContent?.interrupted) {
              this.nextStartTime = this.outputAudioContext.currentTime;
              return;
@@ -207,7 +243,6 @@ export class LiveClient {
             source.buffer = audioBuffer;
             source.connect(this.outputNode);
             
-            // Schedule playback
             const currentTime = this.outputAudioContext.currentTime;
             const startTime = Math.max(currentTime, this.nextStartTime);
             
@@ -240,8 +275,6 @@ export class LiveClient {
     this.outputAudioContext = null;
   }
 
-  // --- Helpers ---
-
   private floatTo16BitPCM(float32Array: Float32Array): Int16Array {
     const int16Array = new Int16Array(float32Array.length);
     for (let i = 0; i < float32Array.length; i++) {
@@ -272,7 +305,6 @@ export class LiveClient {
   }
 
   private async decodeAudioData(data: ArrayBuffer, ctx: AudioContext): Promise<AudioBuffer> {
-     // Raw PCM decoding for 24kHz
      const dataInt16 = new Int16Array(data);
      const buffer = ctx.createBuffer(1, dataInt16.length, AUDIO_OUTPUT_SAMPLE_RATE);
      const channelData = buffer.getChannelData(0);
